@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.testnet
+agents-keys.json
+stats.json
+transactions.jsonl
+logs/
+*.pid
