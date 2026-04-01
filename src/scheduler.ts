@@ -222,7 +222,33 @@ export class Scheduler {
       })
     );
 
-    console.log(`[${new Date().toISOString()}] Scheduler started with 16 patterns`);
+    // ── ESCROW PATTERNS ──
+
+    // Escrow happy path — lock → deliver → claim. Every 2 hours.
+    this.tasks.push(
+      cron.schedule("5 */2 * * *", async () => {
+        const result = await this.executeEscrowHappyPath();
+        this.onResult(result);
+      })
+    );
+
+    // Escrow timeout refund — lock → wait → buyer reclaims. Every 4 hours.
+    this.tasks.push(
+      cron.schedule("35 */4 * * *", async () => {
+        const result = await this.executeEscrowRefundTest();
+        this.onResult(result);
+      })
+    );
+
+    // Escrow early refund (should fail) — proves Stellar predicates work. Every 6 hours.
+    this.tasks.push(
+      cron.schedule("55 */6 * * *", async () => {
+        const result = await this.executeEscrowEarlyRefundTest();
+        this.onResult(result);
+      })
+    );
+
+    console.log(`[${new Date().toISOString()}] Scheduler started with 19 patterns`);
   }
 
   // ── CORE TRANSACTION METHODS ──
@@ -1091,6 +1117,198 @@ export class Scheduler {
         memo: "rep_pricing_error", timestamp: ts,
         type: "payment" as any, protocol: "x402",
         error: `Reputation pricing test failed: ${errorMsg.slice(0, 100)}`,
+      };
+    }
+  }
+
+  // ── ESCROW PATTERNS ──
+
+  /**
+   * Escrow happy path: lock → service delivers → seller claims
+   */
+  async executeEscrowHappyPath(): Promise<TxResult> {
+    const ts = new Date().toISOString();
+    const { buyer, service } = this.pickRandomBuyerAndService();
+    const seller = this.agents.find(a => a.services.some(s => s.id === service.id)) ?? this.agents[1];
+    const amount = Math.min(service.price, 2).toFixed(2);
+
+    try {
+      console.log(`[${ts}] 🔒 ESCROW: ${buyer.name} locking ${amount} XLM for ${service.id}`);
+
+      // Step 1: Create escrow (short timeout for testing — 120s)
+      const createResp = await axios.post(`${this.gatewayUrl}/escrow/create`, {
+        buyerSecret: buyer.secret,
+        seller: seller.pubkey,
+        amount,
+        serviceId: service.id,
+        timeoutSeconds: 120,
+      });
+
+      const { balanceId, txHash: createTxHash } = createResp.data;
+      console.log(`[${ts}] 🔒 ESCROW LOCKED: balanceId=${balanceId?.slice(0, 16)}... tx=${createTxHash?.slice(0, 12)}...`);
+
+      // Step 2: Simulate service delivery (wait 2s)
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Step 3: Seller claims
+      const claimResp = await axios.post(`${this.gatewayUrl}/escrow/claim`, {
+        sellerSecret: seller.secret,
+        balanceId,
+      });
+
+      console.log(`[${ts}] ✅ ESCROW CLAIMED: ${seller.name} claimed ${amount} XLM, tx=${claimResp.data.txHash?.slice(0, 12)}...`);
+
+      return {
+        success: true,
+        latencyMs: Date.now() - new Date(ts).getTime(),
+        buyer: buyer.pubkey,
+        seller: seller.pubkey,
+        serviceId: service.id,
+        amount: parseFloat(amount),
+        memo: `escrow_happy_${service.id}`,
+        timestamp: ts,
+        stellarTxHash: claimResp.data.txHash,
+        type: "payment" as any,
+        protocol: "x402" as any,
+      };
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.error || err.message || String(err);
+      console.error(`[${ts}] ❌ ESCROW HAPPY PATH FAILED: ${errorMsg}`);
+      return {
+        success: false, latencyMs: Date.now() - new Date(ts).getTime(),
+        buyer: buyer.pubkey, serviceId: service.id,
+        amount: parseFloat(amount), memo: "escrow_happy_error",
+        timestamp: ts, type: "payment" as any, error: errorMsg,
+      };
+    }
+  }
+
+  /**
+   * Escrow timeout refund: lock → wait for timeout → buyer reclaims
+   */
+  async executeEscrowRefundTest(): Promise<TxResult> {
+    const ts = new Date().toISOString();
+    const { buyer, service } = this.pickRandomBuyerAndService();
+    const seller = this.agents.find(a => a.services.some(s => s.id === service.id)) ?? this.agents[1];
+    const amount = "0.50";
+
+    try {
+      console.log(`[${ts}] ⏰ ESCROW REFUND TEST: ${buyer.name} locking ${amount} XLM with 30s timeout`);
+
+      // Create escrow with very short timeout (30s for testing)
+      const createResp = await axios.post(`${this.gatewayUrl}/escrow/create`, {
+        buyerSecret: buyer.secret,
+        seller: seller.pubkey,
+        amount,
+        serviceId: service.id,
+        timeoutSeconds: 30,
+      });
+
+      const { balanceId, txHash: createTxHash } = createResp.data;
+      console.log(`[${ts}] ⏰ ESCROW LOCKED (30s timeout): ${createTxHash?.slice(0, 12)}...`);
+
+      // Wait for timeout to expire
+      console.log(`[${ts}] ⏰ Waiting 35s for timeout...`);
+      await new Promise(r => setTimeout(r, 35000));
+
+      // Buyer refunds
+      const refundResp = await axios.post(`${this.gatewayUrl}/escrow/refund`, {
+        buyerSecret: buyer.secret,
+        balanceId,
+      });
+
+      console.log(`[${ts}] ✅ ESCROW REFUNDED: ${buyer.name} reclaimed ${amount} XLM, tx=${refundResp.data.txHash?.slice(0, 12)}...`);
+
+      return {
+        success: true,
+        latencyMs: Date.now() - new Date(ts).getTime(),
+        buyer: buyer.pubkey,
+        serviceId: `${service.id}_refund`,
+        amount: parseFloat(amount),
+        memo: "escrow_refund_test",
+        timestamp: ts,
+        stellarTxHash: refundResp.data.txHash,
+        type: "payment" as any,
+        protocol: "x402" as any,
+      };
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.error || err.message || String(err);
+      console.error(`[${ts}] ❌ ESCROW REFUND TEST FAILED: ${errorMsg}`);
+      return {
+        success: false, latencyMs: Date.now() - new Date(ts).getTime(),
+        buyer: buyer.pubkey, serviceId: service.id,
+        amount: parseFloat(amount), memo: "escrow_refund_error",
+        timestamp: ts, type: "payment" as any, error: errorMsg,
+      };
+    }
+  }
+
+  /**
+   * Escrow early refund attempt: lock → try refund BEFORE timeout → expect failure
+   */
+  async executeEscrowEarlyRefundTest(): Promise<TxResult> {
+    const ts = new Date().toISOString();
+    const { buyer, service } = this.pickRandomBuyerAndService();
+    const seller = this.agents.find(a => a.services.some(s => s.id === service.id)) ?? this.agents[1];
+    const amount = "0.25";
+
+    try {
+      console.log(`[${ts}] 🛡️ ESCROW EARLY REFUND TEST: attempting refund before timeout`);
+
+      // Create escrow with long timeout (1 hour)
+      const createResp = await axios.post(`${this.gatewayUrl}/escrow/create`, {
+        buyerSecret: buyer.secret,
+        seller: seller.pubkey,
+        amount,
+        serviceId: service.id,
+        timeoutSeconds: 3600,
+      });
+
+      const { balanceId } = createResp.data;
+
+      // Immediately try to refund (should fail — timeout not reached)
+      try {
+        await axios.post(`${this.gatewayUrl}/escrow/refund`, {
+          buyerSecret: buyer.secret,
+          balanceId,
+        });
+        // If we get here, the escrow protection FAILED
+        console.error(`[${ts}] ❌ ESCROW PROTECTION FAILED: early refund succeeded when it shouldn't have!`);
+        return {
+          success: false, latencyMs: Date.now() - new Date(ts).getTime(),
+          buyer: buyer.pubkey, serviceId: service.id,
+          amount: parseFloat(amount), memo: "escrow_early_refund_SHOULD_HAVE_FAILED",
+          timestamp: ts, type: "rejection" as any, error: "Early refund succeeded — predicate not enforced!",
+        };
+      } catch (refundErr: any) {
+        // Expected: refund should be rejected
+        const status = refundErr.response?.status;
+        console.log(`[${ts}] ✅ ESCROW PROTECTED: early refund correctly rejected (${status}). Stellar predicates work.`);
+
+        // Now let seller claim so the escrow isn't stuck
+        try {
+          await axios.post(`${this.gatewayUrl}/escrow/claim`, {
+            sellerSecret: seller.secret,
+            balanceId,
+          });
+        } catch { /* cleanup, don't care if it fails */ }
+
+        return {
+          success: true,
+          latencyMs: Date.now() - new Date(ts).getTime(),
+          buyer: buyer.pubkey, serviceId: `${service.id}_early_refund`,
+          amount: parseFloat(amount), memo: "escrow_early_refund_blocked",
+          timestamp: ts, type: "rejection" as any, protocol: "x402" as any,
+        };
+      }
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.error || err.message || String(err);
+      console.error(`[${ts}] ❌ ESCROW EARLY REFUND TEST FAILED: ${errorMsg}`);
+      return {
+        success: false, latencyMs: Date.now() - new Date(ts).getTime(),
+        buyer: buyer.pubkey, serviceId: service.id,
+        amount: parseFloat(amount), memo: "escrow_early_refund_error",
+        timestamp: ts, type: "payment" as any, error: errorMsg,
       };
     }
   }
