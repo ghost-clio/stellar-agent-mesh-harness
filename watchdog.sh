@@ -16,8 +16,8 @@ start_gateway() {
 }
 
 start_harness() {
-  cd "$MESH_DIR/harness"
-  set -a && source .env && set +a
+  cd "$HOME/clawd/projects/stellar-agent-mesh-harness"
+  set -a && source .env 2>/dev/null && set +a
   node dist/index.js >> "$HARNESS_LOG" 2>&1 &
   echo $! > "$PIDFILE_HR"
   echo "[$(date -Iseconds)] Harness started (PID $(cat $PIDFILE_HR))" >> "$MESH_DIR/logs/watchdog.log"

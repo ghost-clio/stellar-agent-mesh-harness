@@ -248,7 +248,69 @@ export class Scheduler {
       })
     );
 
-    console.log(`[${new Date().toISOString()}] Scheduler started with 19 patterns`);
+    // ── STAKING PATTERNS ──
+
+    // Initial staking — each agent stakes on their first service at startup
+    // (runs once after 30 seconds to let services register)
+    setTimeout(async () => {
+      console.log(`[${new Date().toISOString()}] 🥩 STAKING | Agents staking on their services...`);
+      for (const agent of this.agents) {
+        const service = agent.services[0];
+        try {
+          // Step 1: Send XLM to gateway as stake deposit
+          const horizon = new StellarSdk.Horizon.Server(HORIZON_URL);
+          const keypair = StellarSdk.Keypair.fromSecret(agent.secret);
+          const account = await horizon.loadAccount(keypair.publicKey());
+
+          const stakeAmount = (2 + Math.random() * 8).toFixed(7); // 2-10 XLM
+
+          const tx = new StellarSdk.TransactionBuilder(account, {
+            fee: StellarSdk.BASE_FEE,
+            networkPassphrase: StellarSdk.Networks.TESTNET,
+          })
+            .addOperation(StellarSdk.Operation.payment({
+              destination: process.env.RESOURCE_SERVER_ADDRESS || 'GB2UYYBGWKJDZYQWNLS3MQX6QY7UXQSM4P3ROWCHBUVU54CKS5TLBHWI',
+              asset: StellarSdk.Asset.native(),
+              amount: stakeAmount,
+            }))
+            .addMemo(StellarSdk.Memo.text(`stake_${service.id.slice(0, 22)}`))
+            .setTimeout(60)
+            .build();
+
+          tx.sign(keypair);
+          const result = await horizon.submitTransaction(tx);
+
+          // Step 2: Register stake with gateway
+          await axios.post(`${this.gatewayUrl}/stake`, {
+            agent: agent.pubkey,
+            serviceId: service.id,
+            txHash: result.hash,
+          });
+
+          console.log(`[${new Date().toISOString()}] 🥩 STAKED | ${agent.name} | ${stakeAmount} XLM on ${service.id} | tx: ${result.hash.slice(0, 12)}...`);
+        } catch (err: any) {
+          console.log(`[${new Date().toISOString()}] 🥩 STAKE FAILED | ${agent.name} | ${err.message?.slice(0, 60)}`);
+        }
+      }
+    }, 30000);
+
+    // Staking reward cycle — every 2 hours, reward agents who delivered well
+    this.tasks.push(
+      cron.schedule("10 */2 * * *", async () => {
+        const result = await this.executeStakingRewardCycle();
+        this.onResult(result);
+      })
+    );
+
+    // Staking slash test — every 6 hours, slash an agent for misbehavior
+    this.tasks.push(
+      cron.schedule("40 */6 * * *", async () => {
+        const result = await this.executeStakingSlashTest();
+        this.onResult(result);
+      })
+    );
+
+    console.log(`[${new Date().toISOString()}] Scheduler started with 22 patterns (includes staking)`);
   }
 
   // ── CORE TRANSACTION METHODS ──
@@ -1309,6 +1371,94 @@ export class Scheduler {
         buyer: buyer.pubkey, serviceId: service.id,
         amount: parseFloat(amount), memo: "escrow_early_refund_error",
         timestamp: ts, type: "payment" as any, error: errorMsg,
+      };
+    }
+  }
+
+  // ── STAKING METHODS ──
+
+  /**
+   * Staking reward cycle — reward all staked agents for successful deliveries
+   */
+  async executeStakingRewardCycle(): Promise<TxResult> {
+    const ts = new Date().toISOString();
+    const start = performance.now();
+    let rewarded = 0;
+
+    try {
+      for (const agent of this.agents) {
+        for (const service of agent.services) {
+          try {
+            const result = await axios.post(`${this.gatewayUrl}/stake/reward`, {
+              agent: agent.pubkey,
+              serviceId: service.id,
+            });
+            if (result.data.success) {
+              rewarded++;
+              console.log(`[${ts}] 💰 REWARD | ${agent.name} | +${result.data.reward} XLM | balance: ${result.data.newBalance} XLM`);
+            }
+          } catch { /* no stake for this service, skip */ }
+        }
+      }
+
+      const latencyMs = Math.round(performance.now() - start);
+      console.log(`[${ts}] 💰 REWARD CYCLE | ${rewarded} agents rewarded | ${latencyMs}ms`);
+
+      return {
+        success: true, latencyMs, buyer: "staking_system", seller: "all_agents",
+        serviceId: "staking_reward_cycle", amount: 0,
+        memo: `rewarded_${rewarded}_agents`, timestamp: ts,
+        type: "payment" as any, protocol: "x402" as any,
+      };
+    } catch (err: any) {
+      return {
+        success: false, latencyMs: Math.round(performance.now() - start),
+        buyer: "staking_system", serviceId: "staking_reward_cycle",
+        amount: 0, memo: "reward_cycle_error", timestamp: ts,
+        type: "payment" as any, error: err.message?.slice(0, 100),
+      };
+    }
+  }
+
+  /**
+   * Staking slash test — slash a random agent's stake (simulating bad behavior)
+   */
+  async executeStakingSlashTest(): Promise<TxResult> {
+    const ts = new Date().toISOString();
+    const start = performance.now();
+    const agent = this.agents[Math.floor(Math.random() * this.agents.length)];
+    const service = agent.services[0];
+
+    try {
+      // Report failure which auto-slashes
+      const result = await axios.post(`${this.gatewayUrl}/stats/failure`, {
+        agent: agent.pubkey,
+        serviceId: service.id,
+        reason: "quality_below_threshold",
+      });
+
+      const slashInfo = result.data.stakeSlash;
+      const latencyMs = Math.round(performance.now() - start);
+
+      if (slashInfo) {
+        console.log(`[${ts}] ⚡ SLASH | ${agent.name} | -${slashInfo.slashed} XLM | remaining: ${slashInfo.remaining} XLM`);
+      } else {
+        console.log(`[${ts}] ⚡ SLASH | ${agent.name} | no active stake to slash`);
+      }
+
+      return {
+        success: true, latencyMs, buyer: "staking_system", seller: agent.name,
+        serviceId: service.id, amount: slashInfo?.slashed ?? 0,
+        memo: `slashed_${agent.name}`, timestamp: ts,
+        type: "misbehavior" as any, protocol: "x402" as any,
+      };
+    } catch (err: any) {
+      return {
+        success: false, latencyMs: Math.round(performance.now() - start),
+        buyer: "staking_system", seller: agent.name,
+        serviceId: service.id, amount: 0,
+        memo: "slash_test_error", timestamp: ts,
+        type: "misbehavior" as any, error: err.message?.slice(0, 100),
       };
     }
   }
